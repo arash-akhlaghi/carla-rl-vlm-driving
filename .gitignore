@@ -1,0 +1,15 @@
+# Byte-compiled / Cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model Checkpoints (Weights)
+*.zip
+
+# Training Logs
+*.json
+*.log
+
+# System & OS Artifacts
+.DS_Store
+Thumbs.db

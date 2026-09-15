@@ -1,500 +1,570 @@
-import os
-import re
+import json as json_lib
 import time
-import json
-import glob
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
-
-# Prevent GUI backend crashes between OpenCV and Qt
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback
-from carla_vlm_env import CarlaVLMEnv
+import requests
+import zmq
 
 
-# ─────────────────────────────────────────────────────────────
-# 📐  Continuous Linear Learning Rate Schedule
-# ─────────────────────────────────────────────────────────────
-class ContinuousLinearSchedule:
+class CarlaVLMEnv(gym.Env):
     """
-    Step-based continuous learning rate schedule.
-    Prevents LR spikes upon resuming by dynamically decaying from the
-    optimizer's existing checkpoint LR down to the final target rate.
+    CARLA + SAC + Qwen2.5-VL Reinforcement Learning Environment (Phase 5).
+    
+    Key Features:
+    1. VLM-integrated spatial reasoning with temporal latching.
+    2. Softened VLM STOP logic on isolated detections to prevent abrupt stalls.
+    3. Anti-parking linear reward decay with a 5-second hard cutoff.
+    4. Enhanced cruise motivation and controlled intersection motion bonus.
+    5. Calibrated safe-stop distance thresholds (4.5m radar / 4.0m junction boundary).
     """
-    def __init__(self, start_step: int, target_step: int, initial_lr: float, final_lr: float):
-        self.start_step = int(start_step)
-        self.target_step = max(self.start_step + 1, int(target_step))
-        self.initial_lr = float(initial_lr)
-        self.final_lr = float(final_lr)
 
-    def __call__(self, step: int) -> float:
-        if step <= self.start_step:
-            return float(self.initial_lr)
-        progress = min(1.0, max(0.0, float(step - self.start_step) / (self.target_step - self.start_step)))
-        return float(self.initial_lr - (self.initial_lr - self.final_lr) * progress)
+    metadata = {"render_modes": []}
 
+    def __init__(self):
+        super().__init__()
 
-# ─────────────────────────────────────────────────────────────
-# 💾 Official SB3 Replay Buffer Persistence
-# ─────────────────────────────────────────────────────────────
-def save_replay_buffer(model, path: str) -> bool:
-    try:
-        model.save_replay_buffer(path)
-        print(f"💾 Replay buffer saved → {path}")
-        return True
-    except Exception as e:
-        print(f"⚠️ Could not save replay buffer: {e}")
-        return False
+        # Action space: [acceleration (-1.0 to 1.0), steering (-1.0 to 1.0)]
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
 
+        # Observation space: 10-dimensional feature vector
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32,
+        )
 
-def load_replay_buffer(model, path: str) -> int:
-    if not os.path.exists(path):
-        print(f"ℹ️ Replay buffer not found at '{path}' — starting with an empty buffer.")
-        return 0
-    try:
-        model.load_replay_buffer(path)
-        size = model.replay_buffer.size()
-        print(f"✅ Replay buffer restored: {size} transitions loaded.")
-        return size
-    except Exception as e:
-        print(f"⚠️ Could not load replay buffer: {e}")
-        return 0
+        # ZeroMQ server connection to CARLA bridge
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.RCVTIMEO = 30000
+        self.socket.connect("tcp://localhost:5555")
+        print("✅ RL Environment Connected to CARLA Server via ZMQ!")
 
+        # VLM client configuration
+        self.http = requests.Session()
+        self.vlm_url = "http://localhost:11434/v1/chat/completions"
+        self.vlm_model = "qwen2.5vl:7b"
 
-# ─────────────────────────────────────────────────────────────
-# 🔍 Strict 1:1 Checkpoint & Buffer Pairing Discovery
-# ─────────────────────────────────────────────────────────────
-def get_strictly_paired_checkpoint(new_model_path: str):
-    ckpt_files = glob.glob(f"{new_model_path}_ckpt_ep*.zip")
-    if not ckpt_files:
-        return None, None, 0
+        # General tracking variables
+        self.step_count = 0
+        self.last_vlm_signal = 1.0
+        self.last_vlm_reason = "Init"
+        self.current_scenario_id = 1
+        self.last_radar_distance = 30.0
 
-    def extract_ep(path):
-        m = re.search(r"_ckpt_ep(\d+)\.zip$", path)
-        return int(m.group(1)) if m else -1
+        # Temporal latch and anti-jitter parameters
+        self.vlm_stop_hold_steps = 5
+        self.vlm_slow_hold_steps = 4
+        self.vlm_hold_counter = 0
+        self.vlm_hold_level = 1.0
 
-    ckpt_files.sort(key=extract_ep, reverse=True)
+        # Isolated STOP softening counter
+        self.vlm_consecutive_stop_count = 0
+        self.vlm_stop_confirmation_steps = 2
 
-    for ckpt in ckpt_files:
-        ep_num = extract_ep(ckpt)
-        buf_path = f"{new_model_path}_replay_buffer_ep{ep_num}.pkl"
-        if os.path.exists(buf_path):
-            return ckpt, buf_path, ep_num
+        # Anti-parking counter
+        self.consecutive_stop_steps = 0
 
-    return None, None, 0
+        # Junction contextual information
+        self.current_junction_ctx = {
+            "in_junction": False,
+            "approaching_junction": False,
+            "junction_distance": 999.0,
+            "traffic_light": "none",
+            "vehicles_in_junction": 0,
+        }
 
+    def _reconnect_zmq(self):
+        """Safely reconnects ZeroMQ socket upon timeout."""
+        try:
+            self.socket.close(linger=0)
+        except Exception:
+            pass
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.RCVTIMEO = 30000
+        self.socket.connect("tcp://localhost:5555")
 
-# ─────────────────────────────────────────────────────────────
-# 📊 Training Callback & Telemetry
-# ─────────────────────────────────────────────────────────────
-class ConvergenceLogCallbackPhase5(BaseCallback):
-    def __init__(self, target_total_timesteps: int, save_path="sac_carla_phase5_right_of_way",
-                 checkpoint_every=25, verbose=0, buffer_save_path=None,
-                 resume=False, resume_ep=0, lr_schedule=None):
-        super(ConvergenceLogCallbackPhase5, self).__init__(verbose)
-        self.target_total_timesteps = target_total_timesteps
-        self.episode_rewards = []
-        self.current_reward = 0.0
-        self.episode_count = 0
-        self.best_reward = -np.inf
-        self.save_path = save_path
-        self.checkpoint_every = checkpoint_every
-        self.buffer_save_path = buffer_save_path
-        self.log_file = "training_log_phase5_clean.json"
-        self.lr_schedule = lr_schedule
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.step_count = 0
+        self.last_vlm_signal = 1.0
+        self.last_vlm_reason = "Init"
+        self.vlm_hold_counter = 0
+        self.vlm_hold_level = 1.0
+        self.vlm_consecutive_stop_count = 0
+        self.consecutive_stop_steps = 0
+        self.current_scenario_id = 1
+        self.last_radar_distance = 30.0
+        self.current_junction_ctx = {
+            "in_junction": False,
+            "approaching_junction": False,
+            "junction_distance": 999.0,
+            "traffic_light": "none",
+            "vehicles_in_junction": 0,
+        }
 
-        self.episode_ctes = []
-        self.episode_speeds = []
-        self.episode_had_collision = False
-        self.resume = resume
+        self.socket.send_json({"command": "reset", "need_image": True})
+        try:
+            state = self.socket.recv_json()
+        except zmq.error.Again:
+            print("❌ ZMQ timeout during reset. Reconnecting...")
+            self._reconnect_zmq()
+            return np.zeros(10, dtype=np.float32), {}
 
-        SENSIBLE_REWARD_CEILING = 1000.0
+        self.current_junction_ctx = {
+            "in_junction": state.get("in_junction", False),
+            "approaching_junction": state.get("approaching_junction", False),
+            "junction_distance": state.get("junction_distance", 999.0),
+            "traffic_light": state.get("traffic_light", "none"),
+            "vehicles_in_junction": state.get("vehicles_in_junction", 0),
+        }
+        self.current_scenario_id = state.get("scenario_id", 1)
+        radar_dist = float(state.get("radar_distance", 30.0))
+        self.last_radar_distance = radar_dist
 
-        if self.resume and os.path.exists(self.log_file):
-            try:
-                with open(self.log_file, "r") as f:
-                    raw_data = json.load(f)
+        obs = self._get_obs(
+            speed=state.get("speed", 0.0),
+            cte=state.get("cte", 0.0),
+            heading_error=state.get("heading_error", 0.0),
+            dist_to_wp=state.get("dist_to_wp", 0.0),
+            angle_to_wp=state.get("angle_to_wp", 0.0),
+            radar_dist=radar_dist,
+            traffic_light=self.current_junction_ctx.get("traffic_light", "none"),
+            in_junction=self.current_junction_ctx.get("in_junction", False),
+            vehicles_in_junction=self.current_junction_ctx.get("vehicles_in_junction", 0),
+        )
+        return obs, {"image": state.get("image", ""), "vlm_reason": self.last_vlm_reason}
 
-                # Keep historical entries up to loaded episode
-                self.episode_rewards = [d for d in raw_data if d.get("episode", 0) <= resume_ep]
-                self.episode_count = resume_ep
+    def _get_vlm_query_stride(self, radar_dist):
+        """Dynamically adjusts VLM query frequency based on proximity to hazards."""
+        in_junction = self.current_junction_ctx.get("in_junction", False)
+        approaching_junction = self.current_junction_ctx.get("approaching_junction", False)
+        near_junction = in_junction or approaching_junction
 
-                valid_rewards = [
-                    d["reward"] for d in self.episode_rewards
-                    if d["reward"] < SENSIBLE_REWARD_CEILING
-                ]
-                self.best_reward = max(valid_rewards) if valid_rewards else -np.inf
+        if radar_dist <= 8.0:
+            return 1
+        if near_junction:
+            return 2
+        if radar_dist <= 20.0:
+            return 3
+        return 5
 
+    def _process_vlm_signal(self, raw_vlm_signal, reason):
+        """Processes and filters raw VLM output to avoid false-positive stops."""
+        if raw_vlm_signal == 1.0:
+            self.vlm_consecutive_stop_count = 0
+            if self.vlm_hold_counter > 0:
+                self.vlm_hold_counter -= 1
+            else:
+                self.last_vlm_signal = 1.0
+                self.vlm_hold_level = 1.0
+                self.last_vlm_reason = reason
+            return
+
+        if raw_vlm_signal == 0.5:
+            self.vlm_consecutive_stop_count = 0
+            if self.vlm_hold_level == 0.0 and self.vlm_hold_counter > 0:
+                self.vlm_hold_counter -= 1
+                self.last_vlm_reason = reason
+            else:
+                self.last_vlm_signal = 0.5
+                self.vlm_hold_counter = self.vlm_slow_hold_steps
+                self.vlm_hold_level = 0.5
+                self.last_vlm_reason = reason
+            return
+
+        if raw_vlm_signal == 0.0:
+            self.vlm_consecutive_stop_count += 1
+            radar_supports_stop = self.last_radar_distance <= 7.0
+            hard_stop = (
+                radar_supports_stop
+                or (self.vlm_consecutive_stop_count >= self.vlm_stop_confirmation_steps)
+            )
+            if hard_stop:
+                self.last_vlm_signal = 0.0
+                self.vlm_hold_counter = self.vlm_stop_hold_steps
+                self.vlm_hold_level = 0.0
+                self.last_vlm_reason = reason
+                if radar_supports_stop:
+                    print(
+                        f"[VLM] 🛑 STOP CONFIRMED by radar | "
+                        f"radar={self.last_radar_distance:.1f}m | "
+                        f"reason=\"{reason}\""
+                    )
+                else:
+                    print(
+                        f"[VLM] 🛑 STOP CONFIRMED by repeated VLM | "
+                        f"count={self.vlm_consecutive_stop_count} | "
+                        f"reason=\"{reason}\""
+                    )
+            else:
+                self.last_vlm_signal = 0.5
+                self.vlm_hold_counter = self.vlm_slow_hold_steps
+                self.vlm_hold_level = 0.5
+                self.last_vlm_reason = f"VLM STOP->CAUTION: {reason}"
                 print(
-                    f"📄 Logs aligned to Episode {self.episode_count} | "
-                    f"Best valid reward: {self.best_reward:.2f}"
+                    f"[VLM] ⚠️ Isolated STOP -> CAUTION | "
+                    f"radar={self.last_radar_distance:.1f}m | "
+                    f"reason=\"{reason}\""
                 )
 
-                with open(self.log_file, "w") as f:
-                    json.dump(self.episode_rewards, f, indent=4)
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float32)
+        accel_raw = float(np.clip(action[0], -1.0, 1.0))
+        steer_raw = float(np.clip(action[1], -1.0, 1.0))
 
-            except Exception as e:
-                print(f"⚠️ Could not sync log file: {e}")
-                self.episode_rewards = []
+        if accel_raw >= 0.0:
+            throttle = accel_raw
+            brake = 0.0
         else:
-            with open(self.log_file, "w") as f:
-                json.dump([], f)
+            throttle = 0.0
+            brake = abs(accel_raw)
 
-    def _on_step(self) -> bool:
-        reward = self.locals.get("rewards")[0]
-        self.current_reward += reward
-        current_step = self.num_timesteps
+        vlm_query_stride = self._get_vlm_query_stride(self.last_radar_distance)
+        need_image = (self.step_count % vlm_query_stride == 0)
 
-        # Update PyTorch optimizer param groups directly
-        if self.lr_schedule is not None:
-            new_lr = self.lr_schedule(current_step)
-            optimizers = [
-                self.model.policy.actor.optimizer,
-                self.model.policy.critic.optimizer,
-            ]
-            ent_opt = getattr(self.model, "ent_coef_optimizer", None)
-            if ent_opt is not None:
-                optimizers.append(ent_opt)
-
-            for opt in optimizers:
-                for param_group in opt.param_groups:
-                    param_group["lr"] = new_lr
+        self.socket.send_json({
+            "command": "step",
+            "throttle": throttle,
+            "steer": steer_raw,
+            "brake": brake,
+            "need_image": need_image,
+        })
 
         try:
-            obs = self.locals.get("new_obs")
-            if obs is not None and len(obs) > 0:
-                self.episode_speeds.append(float(obs[0][0]))
-                self.episode_ctes.append(abs(float(obs[0][1])))
+            state = self.socket.recv_json()
+        except zmq.error.Again:
+            print("❌ ZMQ timeout during step. Reconnecting...")
+            self._reconnect_zmq()
+            return np.zeros(10, dtype=np.float32), 0.0, True, False, {}
+
+        speed = float(state.get("speed", 0.0))
+        cte = float(state.get("cte", 0.0))
+        heading_error = float(state.get("heading_error", 0.0))
+        dist_to_wp = float(state.get("dist_to_wp", 0.0))
+        angle_to_wp = float(state.get("angle_to_wp", 0.0))
+        radar_dist = float(state.get("radar_distance", 30.0))
+        self.last_radar_distance = radar_dist
+        img_base64 = state.get("image", "")
+        dist_to_target = float(state.get("dist_to_target", 999.0))
+        collision = bool(state.get("collision", False))
+
+        self.current_junction_ctx = {
+            "in_junction": state.get("in_junction", False),
+            "approaching_junction": state.get("approaching_junction", False),
+            "junction_distance": state.get("junction_distance", 999.0),
+            "traffic_light": state.get("traffic_light", "none"),
+            "vehicles_in_junction": state.get("vehicles_in_junction", 0),
+        }
+        self.current_scenario_id = state.get("scenario_id", self.current_scenario_id)
+
+        # Periodic VLM perception inference
+        if need_image and img_base64:
+            raw_vlm_signal, reason = self.get_vlm_feedback(
+                img_base64=img_base64,
+                default_signal=self.last_vlm_signal,
+            )
+            self._process_vlm_signal(raw_vlm_signal, reason)
+        else:
+            if self.vlm_hold_counter > 0:
+                self.vlm_hold_counter -= 1
+            elif self.last_vlm_signal < 1.0:
+                self.last_vlm_signal = 1.0
+                self.vlm_hold_level = 1.0
+                self.last_vlm_reason = "Latch expired"
+                self.vlm_consecutive_stop_count = 0
+
+        tl_state = self.current_junction_ctx.get("traffic_light", "none")
+        in_junction = self.current_junction_ctx.get("in_junction", False)
+        v_count = int(self.current_junction_ctx.get("vehicles_in_junction", 0))
+
+        # Episode termination checks
+        if collision:
+            print("💥 COLLISION DETECTED! Terminating episode.")
+            obs = self._get_obs(speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, tl_state, in_junction, v_count)
+            return obs, -100.0, True, False, {"image": img_base64, "vlm_reason": self.last_vlm_reason, "vlm_signal": self.last_vlm_signal}
+
+        if dist_to_target < 2.5:
+            print("🎯 Target Coordinates Reached! Completed successfully.")
+            obs = self._get_obs(speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, tl_state, in_junction, v_count)
+            return obs, 100.0, True, False, {"image": img_base64, "vlm_reason": self.last_vlm_reason, "vlm_signal": self.last_vlm_signal}
+
+        if abs(cte) > 3.5:
+            print("❌ Vehicle Off-Lane (CTE > 3.5m)! Terminating episode.")
+            obs = self._get_obs(speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, tl_state, in_junction, v_count)
+            return obs, -50.0, True, False, {"image": img_base64, "vlm_reason": self.last_vlm_reason, "vlm_signal": self.last_vlm_signal}
+
+        if self.step_count > 500:
+            print("⏳ Maximum episode steps reached (TRUNCATED, not terminated).")
+            obs = self._get_obs(speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, tl_state, in_junction, v_count)
+            # Truncation preserves bootstrap value targets in SAC
+            return obs, 0.0, False, True, {"image": img_base64, "vlm_reason": self.last_vlm_reason, "vlm_signal": self.last_vlm_signal}
+
+        # ─────────────────────────────────────────────────────────────
+        # Hierarchical Reward Formulation
+        # ─────────────────────────────────────────────────────────────
+        is_radar_danger = (radar_dist <= 4.0)
+        is_danger = (
+            (self.last_vlm_signal < 1.0)
+            or is_radar_danger
+            or (tl_state in ["red", "yellow"])
+        )
+
+        if not is_danger:
+            # NORMAL / SAFE MODE: Higher cruise motivation
+            self.consecutive_stop_steps = 0
+            speed_reward = min(speed, 20.0) * 0.22
+            cte_penalty = abs(cte) * 0.5
+            heading_penalty = (abs(heading_error) / 180.0) * 2.0
+            reward = speed_reward - cte_penalty - heading_penalty
+            if speed < 1.0:
+                reward -= 5.0
+        else:
+            # DANGER MODE: Calibrated approach and junction yielding
+            radar_allowed = float(np.clip(((radar_dist - 3.0) / 12.0) * 8.0, 0.0, 8.0))
+
+            if self.last_vlm_signal == 0.0:
+                junction_dist = self.current_junction_ctx.get("junction_distance", 999.0)
+                # Calibrated thresholds: Approach within 4.5m radar and 4.0m junction boundary
+                if radar_dist > 4.5 and junction_dist > 4.0:
+                    vlm_allowed = 4.0
+                else:
+                    vlm_allowed = 0.0
+            elif self.last_vlm_signal == 0.5:
+                vlm_allowed = 5.0
+            else:
+                vlm_allowed = 8.0
+
+            cautious_allowed_speed = min(radar_allowed, vlm_allowed)
+            if tl_state == "red":
+                cautious_allowed_speed = 0.0
+            elif tl_state == "yellow":
+                cautious_allowed_speed = min(cautious_allowed_speed, 4.0)
+
+            # Danger reward calculation with linear anti-parking decay
+            if cautious_allowed_speed == 0.0:
+                if speed <= 0.5:
+                    self.consecutive_stop_steps += 1
+                    reward = max(0.0, 5.0 - 0.05 * self.consecutive_stop_steps)
+                else:
+                    self.consecutive_stop_steps = 0
+                    reward = -2.0 - (1.5 * speed)
+            else:
+                self.consecutive_stop_steps = 0
+                if speed <= cautious_allowed_speed:
+                    reward = 1.0 + (speed * 0.1)
+                    # Controlled motion bonus inside junction to prevent stalling
+                    if in_junction:
+                        reward += min(speed, 8.0) * 0.15
+                else:
+                    excess_speed = speed - cautious_allowed_speed
+                    reward = -2.0 - (1.5 * excess_speed)
+
+            reward -= abs(cte) * 0.5
+
+        self.step_count += 1
+        obs = self._get_obs(speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, tl_state, in_junction, v_count)
+        info = {
+            "image": img_base64,
+            "vlm_reason": self.last_vlm_reason,
+            "vlm_signal": self.last_vlm_signal,
+            "vlm_hold_counter": self.vlm_hold_counter,
+            "vlm_consecutive_stop_count": self.vlm_consecutive_stop_count,
+            "consecutive_stop_steps": self.consecutive_stop_steps,
+            "scenario_id": self.current_scenario_id,
+        }
+        return obs, reward, False, False, info
+
+    def _get_obs(self, speed, cte, heading_error, dist_to_wp, angle_to_wp, radar_dist, traffic_light, in_junction, vehicles_in_junction):
+        in_junction_encoded = 1.0 if in_junction else 0.0
+        tl = traffic_light.lower() if isinstance(traffic_light, str) else "none"
+
+        if tl == "red":
+            traffic_light_encoded = 0.0
+        elif tl == "yellow":
+            traffic_light_encoded = 0.5
+        elif tl == "green":
+            traffic_light_encoded = 1.0
+        else:
+            traffic_light_encoded = -1.0
+
+        return np.array([
+            speed, cte, heading_error, dist_to_wp, angle_to_wp,
+            self.last_vlm_signal, radar_dist, traffic_light_encoded,
+            in_junction_encoded, float(vehicles_in_junction),
+        ], dtype=np.float32)
+
+    def _build_vlm_prompt(self):
+        return (
+            "You are a collision-risk detector for an autonomous vehicle.\n"
+            "Inspect the asphalt driving path ahead. "
+            "Ignore the vehicle hood at the bottom edge.\n"
+            "Classify immediate hazards "
+            "(vehicles, pedestrians, cyclists, obstacles):\n"
+            '- "stop": Path is directly blocked or an obstacle is entering our lane.\n'
+            '- "slow_down": An obstacle is near the lane edge or entering a crosswalk.\n'
+            '- "proceed": Path ahead is completely clear.\n'
+            "Ignore traffic lights and distant signs.\n"
+            'Respond ONLY in valid JSON:\n'
+            '{"action": "stop" | "slow_down" | "proceed", "reason": "3-5 words"}'
+        )
+
+    def _parse_vlm_json(self, answer, default_signal=1.0):
+        if not answer:
+            return default_signal, "Empty VLM output"
+        clean = answer.strip()
+        if "```" in clean:
+            clean = clean.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+        try:
+            parsed = json_lib.loads(clean)
+            action = str(parsed.get("action", "")).strip().lower()
+            reason = str(parsed.get("reason", "")).strip()
+            if action == "stop":
+                return 0.0, reason or "VLM: stop"
+            if action in ["slow", "slow_down"]:
+                return 0.5, reason or "VLM: slow_down"
+            if action == "proceed":
+                return 1.0, reason or "VLM: proceed"
         except Exception:
             pass
 
-        dones = self.locals.get("dones")
-        if dones is not None and dones[0]:
-            if reward <= -99.0:
-                self.episode_had_collision = True
-
-            self.episode_count += 1
-            progress_pct = (current_step / self.target_total_timesteps) * 100
-
-            current_lr = 1e-5
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start != -1 and end > start:
             try:
-                current_lr = self.model.policy.actor.optimizer.param_groups[0]['lr']
+                parsed = json_lib.loads(clean[start:end + 1])
+                action = str(parsed.get("action", "")).strip().lower()
+                reason = str(parsed.get("reason", "")).strip()
+                if action == "stop":
+                    return 0.0, reason or "VLM: stop"
+                if action in ["slow", "slow_down"]:
+                    return 0.5, reason or "VLM: slow_down"
+                if action == "proceed":
+                    return 1.0, reason or "VLM: proceed"
             except Exception:
                 pass
 
-            ent_coef_value = "auto"
+        return self._fallback_keyword_parse(clean, default_signal)
+
+    def _fallback_keyword_parse(self, text, default_signal=1.0):
+        text_lower = str(text).lower()
+        stop_patterns = ['"action":"stop"', '"action": "stop"', "'action':'stop'", "'action': 'stop'", "action: stop"]
+        for pattern in stop_patterns:
+            if pattern in text_lower:
+                return 0.0, "Fallback: stop"
+
+        slow_patterns = [
+            '"action":"slow_down"', '"action": "slow_down"',
+            '"action":"slow"', '"action": "slow"',
+            "'action':'slow_down'", "'action': 'slow_down'",
+            "'action':'slow'", "'action': 'slow'",
+            "action: slow_down", "action: slow",
+        ]
+        for pattern in slow_patterns:
+            if pattern in text_lower:
+                return 0.5, "Fallback: slow_down"
+
+        proceed_patterns = ['"action":"proceed"', '"action": "proceed"', "'action':'proceed'", "'action': 'proceed'", "action: proceed"]
+        for pattern in proceed_patterns:
+            if pattern in text_lower:
+                return 1.0, "Fallback: proceed"
+
+        return default_signal, "Fallback: preserved previous signal"
+
+    def get_vlm_feedback(self, img_base64, default_signal=1.0):
+        """Dispatches captured scene image to local Ollama Qwen2.5-VL endpoint."""
+        if not img_base64:
+            print(f"[VLM] ⚠️ No image received. Preserving signal={default_signal}")
+            return default_signal, "No image"
+
+        prompt = self._build_vlm_prompt()
+        payload = {
+            "model": self.vlm_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64," + img_base64},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": 40,
+            "keep_alive": -1,
+        }
+
+        start_time = time.perf_counter()
+        print(
+            f"[VLM] 🧠 Querying model={self.vlm_model} | "
+            f"scenario={self.current_scenario_id} | "
+            f"step={self.step_count} | "
+            f"image_bytes≈{len(img_base64)} chars"
+        )
+
+        try:
+            response = self.http.post(self.vlm_url, json=payload, timeout=5.0)
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+
+            if response.status_code != 200:
+                print(f"[VLM] ❌ HTTP Error {response.status_code} | latency={latency_ms:.1f} ms | response={response.text[:300]}")
+                return default_signal, "VLM HTTP error"
+
             try:
-                ent_coef_value = float(self.model.ent_coef_tensor.exp().item())
-            except Exception:
-                pass
+                response_data = response.json()
+            except ValueError as e:
+                print(f"[VLM] ❌ Invalid JSON response | latency={latency_ms:.1f} ms | error={e}")
+                return default_signal, "VLM invalid API JSON"
 
-            recent_rewards = [d["reward"] for d in self.episode_rewards[-(min(10, len(self.episode_rewards))):]]
-            recent_rewards.append(round(self.current_reward, 2))
-            running_avg = np.mean(recent_rewards) if recent_rewards else self.current_reward
+            choices = response_data.get("choices", [])
+            if not choices:
+                print(f"[VLM] ❌ No choices returned | latency={latency_ms:.1f} ms")
+                return default_signal, "VLM: no choices"
 
-            avg_cte = float(np.mean(self.episode_ctes)) if self.episode_ctes else 0.0
-            avg_speed = float(np.mean(self.episode_speeds)) if self.episode_speeds else 0.0
-            had_collision = bool(self.episode_had_collision)
+            message = choices[0].get("message", {})
+            answer = str(message.get("content", "")).strip()
+            if not answer:
+                print(f"[VLM] ❌ Empty model output | latency={latency_ms:.1f} ms")
+                return default_signal, "VLM: empty output"
 
-            print(
-                f"🏁 Ep {self.episode_count} Finished | "
-                f"Reward: {self.current_reward:.2f} | "
-                f"Avg(10): {running_avg:.2f} | "
-                f"LR: {current_lr:.2e} | "
-                f"α: {ent_coef_value if isinstance(ent_coef_value, str) else f'{ent_coef_value:.4f}'} | "
-                f"CTE: {avg_cte:.2f} | Spd: {avg_speed:.1f} km/h | "
-                f"Coll: {'YES' if had_collision else 'no'} | "
-                f"📈 {progress_pct:.1f}% ({current_step}/{self.target_total_timesteps})"
-            )
+            print(f"[VLM] 📥 Raw output: {answer}")
+            raw_signal, reason = self._parse_vlm_json(answer, default_signal)
 
-            self.episode_rewards.append({
-                "episode": int(self.episode_count),
-                "reward": float(round(self.current_reward, 2)),
-                "running_avg_10": float(round(running_avg, 2)),
-                "learning_rate": float(current_lr),
-                "entropy_coef": float(ent_coef_value) if not isinstance(ent_coef_value, str) else None,
-                "timestep": int(current_step),
-                "cte": avg_cte,
-                "speed": avg_speed,
-                "collision": had_collision,
-            })
+            action_name = "STOP" if raw_signal == 0.0 else ("SLOW_DOWN" if raw_signal == 0.5 else "PROCEED")
+            print(f"[VLM] ✅ Result: action={action_name} | signal={raw_signal:.1f} | reason=\"{reason}\" | latency={latency_ms:.1f} ms")
+            return raw_signal, reason
 
-            with open(self.log_file, "w") as f:
-                json.dump(self.episode_rewards, f, indent=4)
-
-            # Persist best performing checkpoint
-            if (self.current_reward > self.best_reward and self.current_reward < 1000.0):
-                self.best_reward = self.current_reward
-                best_path = f"{self.save_path}_best"
-                try:
-                    self.model.save(best_path)
-                    print(f"  🏆 New best model saved as '{best_path}.zip'")
-                except Exception as e:
-                    print(f"  ⚠️ Best model save failed: {e}")
-
-            # Save synchronized checkpoint pair
-            if self.episode_count % self.checkpoint_every == 0:
-                ckpt_path = f"{self.save_path}_ckpt_ep{self.episode_count}"
-                buf_saved = True
-
-                if self.buffer_save_path:
-                    buf_path = f"{self.buffer_save_path}_ep{self.episode_count}.pkl"
-                    buf_saved = save_replay_buffer(self.model, buf_path)
-
-                if buf_saved:
-                    try:
-                        self.model.save(ckpt_path)
-                        print(f"  💾 Model checkpoint saved: '{ckpt_path}.zip'")
-                        self._prune_old_checkpoints(keep=3)
-                    except Exception as e:
-                        print(f"  ⚠️ Periodic checkpoint save failed: {e}")
-
-            self.current_reward = 0.0
-            self.episode_ctes = []
-            self.episode_speeds = []
-            self.episode_had_collision = False
-
-        return True
-
-    def _prune_old_checkpoints(self, keep=3):
-        try:
-            ckpt_files = glob.glob(f"{self.save_path}_ckpt_ep*.zip")
-            def extract_ep(path):
-                m = re.search(r"_ckpt_ep(\d+)\.zip$", path)
-                return int(m.group(1)) if m else -1
-
-            ckpt_files.sort(key=extract_ep)
-            for old_ckpt in ckpt_files[:-keep]:
-                ep = extract_ep(old_ckpt)
-                old_buf = f"{self.buffer_save_path}_ep{ep}.pkl"
-                if os.path.exists(old_ckpt):
-                    os.remove(old_ckpt)
-                if os.path.exists(old_buf):
-                    os.remove(old_buf)
-                print(f"  🧹 Pruned checkpoint pair: Episode {ep}")
+        except requests.Timeout:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            print(f"[VLM] ⚠️ Inference timeout | latency={latency_ms:.1f} ms | preserving signal={default_signal}")
+            return default_signal, "VLM timeout"
+        except requests.RequestException as e:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            print(f"[VLM] ❌ Request error | latency={latency_ms:.1f} ms | error={e}")
+            return default_signal, "VLM request error"
         except Exception as e:
-            print(f"⚠️ Checkpoint pruning warning: {e}")
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            print(f"[VLM] ❌ Unexpected error | latency={latency_ms:.1f} ms | error={e}")
+            return default_signal, "VLM unexpected error"
 
-
-# ─────────────────────────────────────────────────────────────
-# 📈 Plotting
-# ─────────────────────────────────────────────────────────────
-def plot_convergence(log_file="training_log_phase5_clean.json", output_img="convergence_plot_phase5_clean.png"):
-    try:
-        if not os.path.exists(log_file):
-            return
-        with open(log_file, "r") as f:
-            data = json.load(f)
-        if not data:
-            return
-
-        episodes = [d["episode"] for d in data]
-        rewards = [d["reward"] for d in data]
-        window = min(10, len(rewards))
-        moving_avg = np.convolve(rewards, np.ones(window) / window, mode='valid') if window > 1 else rewards
-
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 14), gridspec_kw={'height_ratios': [3, 1, 1]})
-
-        ax1.plot(episodes, rewards, color='lightblue', alpha=0.6, label='Episodic Reward')
-        if window > 1:
-            ax1.plot(episodes[(window - 1):], moving_avg, color='darkblue', linewidth=2, label=f'{window}-Ep Moving Average')
-        ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-        ax1.set_title('Phase 5: Right of Way & Intersection Yielding', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Episode', fontsize=12)
-        ax1.set_ylabel('Total Reward', fontsize=12)
-        ax1.grid(True, linestyle='--', alpha=0.7)
-        ax1.legend()
-
-        lrs = [d.get("learning_rate", 0) for d in data]
-        ax2.plot(episodes, lrs, color='tab:orange', linewidth=1.5, label='Learning Rate')
-        ax2.set_xlabel('Episode', fontsize=12)
-        ax2.set_ylabel('Learning Rate', fontsize=10, color='tab:orange')
-        ax2.grid(True, linestyle='--', alpha=0.5)
-
-        ctes = [d.get("cte", 0.0) for d in data]
-        speeds = [d.get("speed", 0.0) for d in data]
-        collisions = [1 if d.get("collision", False) else 0 for d in data]
-
-        ax3.plot(episodes, ctes, color='tab:red', linewidth=1.2, label='Avg |CTE| (m)')
-        ax3.plot(episodes, speeds, color='tab:blue', linewidth=1.2, label='Avg Speed (km/h)')
-        ax3.set_xlabel('Episode', fontsize=12)
-        ax3.set_ylabel('CTE (m) / Speed (km/h)', fontsize=10)
-        ax3.grid(True, linestyle='--', alpha=0.5)
-
-        collision_eps = [ep for ep, c in zip(episodes, collisions) if c == 1]
-        collision_ctes = [d["cte"] for d in data if d.get("collision", False)]
-        if collision_eps:
-            ax3.scatter(collision_eps, collision_ctes, color='red', marker='x', s=40, label='Collision', zorder=5)
-        ax3.legend(loc='upper right')
-
-        plt.tight_layout()
-        plt.savefig(output_img, dpi=150)
-        plt.close(fig)
-    except Exception as e:
-        print(f"⚠️ Could not generate plot: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# 🚀 Main Training Loop
-# ─────────────────────────────────────────────────────────────
-def main():
-    print("=" * 70)
-    print("🚦  PHASE 5 — RIGHT OF WAY & INTERSECTION YIELDING")
-    print("=" * 70)
-
-    # Runtime configuration: Resume to 80k global timesteps
-    RESUME = True
-    CUMULATIVE_TARGET_STEPS = 80_000
-
-    env = CarlaVLMEnv()
-    base_model_path = "sac_carla_phase5_init"
-    new_model_path = "sac_carla_phase5_final"
-    buffer_save_base = f"{new_model_path}_replay_buffer"
-
-    load_path = base_model_path
-    paired_buffer_path = None
-    resume_ep = 0
-    resumed = False
-
-    if RESUME:
-        final_model_zip = f"{new_model_path}.zip"
-        final_buf_pkl = f"{buffer_save_base}_latest.pkl"
-
-        # Priority 1: Load final session state (Episode 146 / 49,972 steps)
-        if os.path.exists(final_model_zip) and os.path.exists(final_buf_pkl):
-            load_path = new_model_path
-            paired_buffer_path = final_buf_pkl
-
-            if os.path.exists("training_log_phase5_clean.json"):
-                try:
-                    with open("training_log_phase5_clean.json", "r") as f:
-                        log_data = json.load(f)
-                        resume_ep = int(log_data[-1]["episode"]) if log_data else 0
-                except Exception:
-                    resume_ep = 146
-            else:
-                resume_ep = 146
-
-            resumed = True
-            print(f"🔥 Found Completed 50k State! Loading Final Model: '{final_model_zip}' ↔ '{final_buf_pkl}' (Ep {resume_ep})")
-
-        # Priority 2: Fallback to latest strictly paired checkpoint
-        else:
-            ckpt_path, paired_buf, ep_num = get_strictly_paired_checkpoint(new_model_path)
-            if ckpt_path and paired_buf:
-                load_path = ckpt_path.replace(".zip", "")
-                paired_buffer_path = paired_buf
-                resume_ep = ep_num
-                resumed = True
-                print(f"🔄 Checkpoint Pair Found: Model '{ckpt_path}' ↔ Buffer '{paired_buf}' (Ep {ep_num})")
-            else:
-                print("❌ CRITICAL ERROR: Resume is True, but no compatible checkpoint was found!")
-                return
-
-    model = SAC.load(
-        load_path,
-        env=env,
-        device="cuda"
-    )
-    print(f"   ⏱️  Loaded model internal timestep: {model.num_timesteps}")
-
-    model.tau = 0.005
-    model.gradient_steps = 1
-    model.action_noise = None
-
-    # Smoke test serialization sanity
-    smoke_file = "test_save_smoke.zip"
-    try:
-        if os.path.exists(smoke_file):
-            os.remove(smoke_file)
-        model.save("test_save_smoke")
-        if os.path.exists(smoke_file):
-            os.remove(smoke_file)
-        print("✅ Serialization sanity check passed.")
-    except Exception as e:
-        if os.path.exists(smoke_file):
-            os.remove(smoke_file)
-        print(f"❌ Critical: model.save failed sanity check: {e}")
-        return
-
-    if resumed and paired_buffer_path:
-        restored = load_replay_buffer(model, paired_buffer_path)
-        if restored > model.batch_size:
-            model.learning_starts = 0
-            print("⚡ learning_starts set to 0 (Warmup bypassed with loaded buffer).")
-
-    # Read current checkpoint LR to enforce seamless continuation without spikes
-    current_loaded_lr = 1e-4
-    try:
-        current_loaded_lr = float(model.policy.actor.optimizer.param_groups[0]['lr'])
-    except Exception:
-        pass
-
-    if resumed:
-        # Decays smoothly from ~1.005e-5 to 5.00e-6 across the final 30,028 steps
-        lr_schedule = ContinuousLinearSchedule(
-            start_step=model.num_timesteps,
-            target_step=CUMULATIVE_TARGET_STEPS,
-            initial_lr=current_loaded_lr,
-            final_lr=5e-6
-        )
-        print(f"🎯 Resumed LR Policy: Smooth decay from {current_loaded_lr:.2e} → 5.00e-06 (No Jump!)")
-    else:
-        lr_schedule = ContinuousLinearSchedule(
-            start_step=0,
-            target_step=CUMULATIVE_TARGET_STEPS,
-            initial_lr=1e-4,
-            final_lr=1e-5
-        )
-
-    steps_to_train = max(0, CUMULATIVE_TARGET_STEPS - model.num_timesteps)
-    print(f"🎯 Target Steps: {CUMULATIVE_TARGET_STEPS} | Remaining Steps to Train: {steps_to_train}")
-
-    if steps_to_train == 0:
-        print("🎉 Target timesteps already achieved!")
-        return
-
-    logger = ConvergenceLogCallbackPhase5(
-        target_total_timesteps=CUMULATIVE_TARGET_STEPS,
-        save_path=new_model_path,
-        checkpoint_every=25,
-        buffer_save_path=buffer_save_base,
-        resume=resumed,
-        resume_ep=resume_ep,
-        lr_schedule=lr_schedule,
-    )
-
-    start_time = time.time()
-
-    try:
-        model.learn(
-            total_timesteps=steps_to_train,
-            callback=logger,
-            reset_num_timesteps=not resumed,
-        )
-    except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user. Saving progress...")
-    finally:
-        end_time = time.time()
-        elapsed_minutes = (end_time - start_time) / 60
-        print(f"\n⏱️ Session duration: {elapsed_minutes:.1f} minutes.")
-
+    def close(self):
         try:
-            model.save(new_model_path)
-            print(f"💾 Final Model saved: '{new_model_path}.zip'")
-        except Exception as e:
-            print(f"⚠️ Could not save final model: {e}")
-
-        final_buf_path = f"{buffer_save_base}_latest.pkl"
-        save_replay_buffer(model, final_buf_path)
-
-        env.close()
-        plot_convergence(log_file=logger.log_file)
-        print("🎉 Phase 5 Session Complete!")
-
-
-if __name__ == "__main__":
-    main()
+            self.socket.close(linger=0)
+        except Exception:
+            pass
+        try:
+            self.http.close()
+        except Exception:
+            pass
+        try:
+            self.context.term()
+        except Exception:
+            pass
+        super().close()

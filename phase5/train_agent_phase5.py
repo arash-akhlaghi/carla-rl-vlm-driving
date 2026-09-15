@@ -5,7 +5,7 @@ import json
 import glob
 import numpy as np
 
-# 🛑 جلوگیری قطعی از کرش ناشی از تداخل OpenCV با Qt
+# Prevent GUI backend crashes between OpenCV and Qt
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -16,18 +16,13 @@ from carla_vlm_env import CarlaVLMEnv
 
 
 # ─────────────────────────────────────────────────────────────
-# 📐  Seamless Continuous Linear Learning Rate Schedule
+# 📐  Continuous Linear Learning Rate Schedule
 # ─────────────────────────────────────────────────────────────
 class ContinuousLinearSchedule:
     """
-    Continuous step-based learning rate schedule without arbitrary restarts or jumps.
-    Supports seamless resuming:
-        - If fresh start: decays from initial_lr to final_lr over [0, target_step].
-        - If resumed: decays from loaded_lr (~1e-5) to target_lr over [start_step, target_step].
-
-    Formula:
-        progress = (current_step - start_step) / (target_step - start_step)
-        LR = initial_lr - (initial_lr - final_lr) * progress
+    Step-based continuous learning rate schedule.
+    Prevents LR spikes upon resuming by dynamically decaying from the
+    optimizer's existing checkpoint LR down to the final target rate.
     """
     def __init__(self, start_step: int, target_step: int, initial_lr: float, final_lr: float):
         self.start_step = int(start_step)
@@ -123,7 +118,7 @@ class ConvergenceLogCallbackPhase5(BaseCallback):
                 with open(self.log_file, "r") as f:
                     raw_data = json.load(f)
 
-                # حفظ تاریخچه پیشین و اتصال دقیق اپیزودها
+                # Keep historical entries up to loaded episode
                 self.episode_rewards = [d for d in raw_data if d.get("episode", 0) <= resume_ep]
                 self.episode_count = resume_ep
 
@@ -153,7 +148,7 @@ class ConvergenceLogCallbackPhase5(BaseCallback):
         self.current_reward += reward
         current_step = self.num_timesteps
 
-        # به‌روزرسانی نرخ یادگیری پیوسته
+        # Update PyTorch optimizer param groups directly
         if self.lr_schedule is not None:
             new_lr = self.lr_schedule(current_step)
             optimizers = [
@@ -230,7 +225,7 @@ class ConvergenceLogCallbackPhase5(BaseCallback):
             with open(self.log_file, "w") as f:
                 json.dump(self.episode_rewards, f, indent=4)
 
-            # ذخیره بهترین مدل
+            # Persist best performing checkpoint
             if (self.current_reward > self.best_reward and self.current_reward < 1000.0):
                 self.best_reward = self.current_reward
                 best_path = f"{self.save_path}_best"
@@ -240,7 +235,7 @@ class ConvergenceLogCallbackPhase5(BaseCallback):
                 except Exception as e:
                     print(f"  ⚠️ Best model save failed: {e}")
 
-            # ذخیره دوره‌ای همزمان مدل و بافر
+            # Save synchronized checkpoint pair
             if self.episode_count % self.checkpoint_every == 0:
                 ckpt_path = f"{self.save_path}_ckpt_ep{self.episode_count}"
                 buf_saved = True
@@ -350,9 +345,7 @@ def main():
     print("🚦  PHASE 5 — RIGHT OF WAY & INTERSECTION YIELDING")
     print("=" * 70)
 
-    # ══════════════════════════════════════════════════════════════
-    # ⚙️ RUNTIME CONFIGURATION
-    # ══════════════════════════════════════════════════════════════
+    # Runtime configuration: Resume to 80k global timesteps
     RESUME = True
     CUMULATIVE_TARGET_STEPS = 80_000
 
@@ -370,7 +363,7 @@ def main():
         final_model_zip = f"{new_model_path}.zip"
         final_buf_pkl = f"{buffer_save_base}_latest.pkl"
 
-        # اولویت ۱: لود مستقیم فایل‌های پایان اپیزود ۱۴۶
+        # Priority 1: Load final session state (Episode 146 / 49,972 steps)
         if os.path.exists(final_model_zip) and os.path.exists(final_buf_pkl):
             load_path = new_model_path
             paired_buffer_path = final_buf_pkl
@@ -388,7 +381,7 @@ def main():
             resumed = True
             print(f"🔥 Found Completed 50k State! Loading Final Model: '{final_model_zip}' ↔ '{final_buf_pkl}' (Ep {resume_ep})")
 
-        # اولویت ۲: استفاده از آخرین چک‌پوینت دوره‌ای در صورت نبود فایل نهایی
+        # Priority 2: Fallback to latest strictly paired checkpoint
         else:
             ckpt_path, paired_buf, ep_num = get_strictly_paired_checkpoint(new_model_path)
             if ckpt_path and paired_buf:
@@ -398,7 +391,7 @@ def main():
                 resumed = True
                 print(f"🔄 Checkpoint Pair Found: Model '{ckpt_path}' ↔ Buffer '{paired_buf}' (Ep {ep_num})")
             else:
-                print(f"❌ CRITICAL ERROR: Resume is True, but no compatible checkpoint was found!")
+                print("❌ CRITICAL ERROR: Resume is True, but no compatible checkpoint was found!")
                 return
 
     model = SAC.load(
@@ -412,7 +405,7 @@ def main():
     model.gradient_steps = 1
     model.action_noise = None
 
-    # تست سلامت ذخیره‌سازی
+    # Smoke test serialization sanity
     smoke_file = "test_save_smoke.zip"
     try:
         if os.path.exists(smoke_file):
@@ -433,7 +426,7 @@ def main():
             model.learning_starts = 0
             print("⚡ learning_starts set to 0 (Warmup bypassed with loaded buffer).")
 
-    # استخراج نرخ یادگیری لودشده جهت حذف کامل LR Jump
+    # Read current checkpoint LR to enforce seamless continuation without spikes
     current_loaded_lr = 1e-4
     try:
         current_loaded_lr = float(model.policy.actor.optimizer.param_groups[0]['lr'])
@@ -441,7 +434,7 @@ def main():
         pass
 
     if resumed:
-        # شروع نرم از همان LR پایان ۵۰k (~1.005e-5) تا کف 5e-6 در استپ ۸۰k
+        # Decays smoothly from ~1.005e-5 to 5.00e-6 across the final 30,028 steps
         lr_schedule = ContinuousLinearSchedule(
             start_step=model.num_timesteps,
             target_step=CUMULATIVE_TARGET_STEPS,

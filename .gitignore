@@ -12,4 +12,4 @@ __pycache__/
 
 # System & OS Artifacts
 .DS_Store
-Thumbs.db
+Thumbs.db*.pkl

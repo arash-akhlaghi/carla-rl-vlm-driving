@@ -12,7 +12,8 @@ def main():
     print("🚗 Initializing CARLA-VLM Environment for PHASE 5 TEST...")
     env = CarlaVLMEnv()
     
-    model_path = "sac_carla_phase5_init"
+    # model_path = "sac_carla_phase5_init"
+    model_path = "sac_carla_phase5_final"
     print(f"🧠 Loading trained brain from {model_path}.zip...")
     
     try:

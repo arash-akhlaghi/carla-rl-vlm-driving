@@ -20,7 +20,6 @@ def noisy_dist(base, noise_range=3.0):
 # ==========================================================================
 # RIGHT-OF-WAY CROSS-TRAFFIC DIVERSITY
 # ==========================================================================
-# We set CLEAR probability to 0.0 → only CRITICAL cross traffic.
 CROSS_TRAFFIC_CLEAR_PROB = 0.0
 CRITICAL_CROSS_DISTANCE_RANGE = (2.0, 5.0)
 CRITICAL_CROSS_SPEED_RANGE = (45.0, 52.0)
@@ -47,33 +46,28 @@ def sample_cross_traffic_profile():
         "speed_diff": -35.0,
     }
 
-def find_lead_wp_before_first_junction(vehicle, route, min_ahead=2.0, max_ahead=4.0):
-    """Find a lead-convoy waypoint ahead of Ego but still before the first junction."""
-    if not route:
+def find_lead_wp_ahead(vehicle, route, min_ahead=6.0, max_ahead=11.0):
+    """Pick a lead-convoy waypoint safely ahead along the route."""
+    if not route or len(route) < 12:
         return None, 0.0
-    ego_loc = vehicle.get_location()
-    closest_idx = min(range(len(route)), key=lambda i: route[i].transform.location.distance(ego_loc))
-    junction_indices = [i for i, wp in enumerate(route) if wp.is_junction and i >= closest_idx]
-    if not junction_indices:
+
+    closest_idx = 0
+    if vehicle is not None:
+        loc = vehicle.get_location()
+        if abs(loc.x) > 0.1 or abs(loc.y) > 0.1:
+            closest_idx = min(range(len(route)), key=lambda i: route[i].transform.location.distance(loc))
+
+    target_offset = int(random.uniform(min_ahead, max_ahead))
+    target_idx = closest_idx + target_offset
+
+    if target_idx >= len(route):
+        target_idx = len(route) - 2
+
+    if target_idx <= closest_idx:
         return None, 0.0
-    first_junction_idx = junction_indices[0]
-    candidates = []
-    for i in range(closest_idx + 1, first_junction_idx):
-        d = route[i].transform.location.distance(ego_loc)
-        if min_ahead <= d <= max_ahead:
-            candidates.append((i, d))
-    if candidates:
-        idx, d = random.choice(candidates)
-        return route[idx], float(d)
-    fallback = []
-    for i in range(closest_idx + 1, first_junction_idx):
-        d = route[i].transform.location.distance(ego_loc)
-        if d > 0.8:
-            fallback.append((i, d))
-    if fallback:
-        idx, d = max(fallback, key=lambda item: item[1])
-        return route[idx], float(d)
-    return None, 0.0
+
+    actual_dist = route[target_idx].transform.location.distance(route[closest_idx].transform.location)
+    return route[target_idx], float(actual_dist)
 
 # ==========================================================================
 # 🧭 HELPER FUNCTIONS FOR CROSS-VEHICLE SPAWNING
@@ -356,39 +350,312 @@ def get_junction_context(vehicle, world, route):
     }
 
 # ==========================================================================
+# 🛡️ NPC SAFETY SHIELD — last-resort collision prevention
+# ==========================================================================
+# DESIGN PHILOSOPHY:
+#   * LAST-RESORT safety net to keep training episodes clean.
+#   * NOT a right-of-way / yield mechanism.
+#   * NPCs still cross the conflict point BEFORE Ego whenever possible.
+#   * Ego -> NPC collisions (ego's fault): NOT prevented.
+#   * NPC -> Ego collisions from the blind sides (REAR / LEFT / RIGHT):
+#     prevented, because ego's sensors cannot see them.
+#   * NPC <-> NPC collisions: prevented from ANY direction.
+#
+# SCOPE:
+#   * Active only for scenarios 1-5 (main call site gates by scenario_id).
+#   * Scenarios 6, 7, 8 are intentionally NOT shielded:
+#       - 6/7 place an obstacle directly on Ego's path; perception + RL must
+#         handle it.
+#       - 8 is a multi-threat scenario (pedestrian + vehicle); the vehicle
+#         arrives after the pedestrian triggers, so the challenge must remain.
+# ==========================================================================
+
+def _actor_speed_kmh(actor):
+    """Return actor speed in km/h."""
+    if actor is None or not actor.is_alive:
+        return 0.0
+    v = actor.get_velocity()
+    return 3.6 * math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+
+def _set_npc_target_speed(npc, target_kmh, shield_meta):
+    """Set an NPC's target speed via Traffic Manager without disabling autopilot."""
+    if npc is None or not npc.is_alive:
+        return
+    speed_limit_kmh = 50.0
+    diff = (speed_limit_kmh - max(0.0, float(target_kmh))) / speed_limit_kmh * 100.0
+    diff = float(np.clip(diff, -80.0, 100.0))
+    tm.vehicle_percentage_speed_difference(npc, diff)
+    if shield_meta is not None:
+        shield_meta["active"] = True
+
+
+def _restore_npc_speed(npc, shield_meta):
+    """Restore an NPC's original TM speed difference after the shield releases."""
+    if npc is None or not npc.is_alive:
+        return
+    if shield_meta is None or not shield_meta.get("active", False):
+        return
+    orig_diff = shield_meta.get("orig_diff", 0.0)
+    tm.vehicle_percentage_speed_difference(npc, orig_diff)
+    shield_meta["active"] = False
+
+
+def _closest_approach_metrics(a, b):
+    """
+    Return (tcpa, cpa_distance, closing_speed).
+
+    TCPA is the time until closest point of approach; CPA is the minimum
+    distance between the two actors assuming they keep their current
+    velocities. A small CPA indicates a genuine collision course, even if
+    the current straight-line distance is still large.
+
+    Handles the perpendicular T-bone case that simple distance-based rules
+    cannot detect.
+    """
+    a_loc = a.get_location()
+    b_loc = b.get_location()
+    a_v = a.get_velocity()
+    b_v = b.get_velocity()
+
+    dx = b_loc.x - a_loc.x
+    dy = b_loc.y - a_loc.y
+    dvx = b_v.x - a_v.x
+    dvy = b_v.y - a_v.y
+
+    dv_dot_dv = dvx * dvx + dvy * dvy
+    if dv_dot_dv < 0.05:
+        dist = math.sqrt(dx * dx + dy * dy)
+        return 999.0, dist, 0.0
+
+    t_cpa = -(dx * dvx + dy * dvy) / dv_dot_dv
+    if t_cpa < 0.0:
+        dist = math.sqrt(dx * dx + dy * dy)
+        return 0.0, dist, 0.0
+    if t_cpa > 6.0:
+        return t_cpa, 999.0, 0.0
+
+    cpa_x = dx + dvx * t_cpa
+    cpa_y = dy + dvy * t_cpa
+    cpa_dist = math.sqrt(cpa_x * cpa_x + cpa_y * cpa_y)
+
+    dist_now = math.sqrt(dx * dx + dy * dy)
+    if dist_now < 0.05:
+        closing = 0.0
+    else:
+        ux, uy = dx / dist_now, dy / dist_now
+        closing = -(dvx * ux + dvy * uy)
+
+    return t_cpa, cpa_dist, closing
+
+
+def _npc_ego_zone(ego, npc):
+    """Return the position of NPC in ego's local frame: FRONT / REAR / LEFT / RIGHT."""
+    ego_loc = ego.get_location()
+    ego_fwd = ego.get_transform().get_forward_vector()
+    ego_right = ego.get_transform().get_right_vector()
+    npc_loc = npc.get_location()
+
+    dx = npc_loc.x - ego_loc.x
+    dy = npc_loc.y - ego_loc.y
+
+    long_proj = ego_fwd.x * dx + ego_fwd.y * dy
+    lat_proj = ego_right.x * dx + ego_right.y * dy
+
+    if abs(long_proj) >= abs(lat_proj):
+        return "FRONT" if long_proj > 0 else "REAR"
+    return "RIGHT" if lat_proj > 0 else "LEFT"
+
+
+def npc_safety_shield(ego_vehicle, npcs, shield_meta):
+    """
+    Unified, minimal-intervention safety net for cross-traffic NPCs.
+
+    Runs BEFORE world.tick(), so speed adjustments take effect on this tick.
+    Uses TM speed control (autopilot stays ON), so both steering and the
+    built-in TM collision checks remain functional.
+
+    Rules (in order of priority):
+      0. EMERGENCY BRAKE: for any side/rear NPC, if TCPA < 1.2 s AND CPA < 1.5 m,
+         force target speed to 0. At that point the NPC cannot clear the
+         intersection and the only safe action is to let Ego pass.
+      1. NPC <-> NPC: any direction, TCPA < 1.5 s and CPA < 4 m -> slow the
+         faster one.
+      2. NPC -> Ego from LEFT/RIGHT: TCPA < 2.0 s and CPA < 4 m -> speed the
+         NPC up so it clears the intersection faster. If already at max
+         speed, slow it down as a fallback.
+      3. NPC -> Ego from REAR: TCPA < 2.0 s and CPA < 3 m -> slow the NPC
+         down to avoid a rear-end / merge collision.
+      4. NPC -> Ego from FRONT: never touched (ego's responsibility).
+    """
+    if not npcs:
+        return
+
+    live = [n for n in npcs if n is not None and n.is_alive]
+
+    # --------------------------------------------------------------
+    # 0. EMERGENCY BRAKE — must run first, overrides everything else.
+    # --------------------------------------------------------------
+    for npc in live:
+        meta = shield_meta.get(npc.id)
+        if meta is None:
+            continue
+
+        zone = _npc_ego_zone(ego_vehicle, npc)
+        if zone == "FRONT":
+            continue
+
+        tcpa, cpa_dist, closing = _closest_approach_metrics(npc, ego_vehicle)
+        if tcpa < 1.2 and cpa_dist < 1.5 and closing >= 0.3:
+            _set_npc_target_speed(npc, 0.0, meta)
+            print(
+                f"   🛑 NPC emergency brake (id={npc.id}, {zone}): "
+                f"TCPA={tcpa:.2f}s CPA={cpa_dist:.2f}m → target=0"
+            )
+
+    # --------------------------------------------------------------
+    # 1. NPC <-> NPC (any direction)
+    # --------------------------------------------------------------
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            a = live[i]
+            b = live[j]
+
+            meta_a = shield_meta.get(a.id)
+            meta_b = shield_meta.get(b.id)
+
+            tcpa, cpa_dist, closing = _closest_approach_metrics(a, b)
+            if tcpa > 1.5 or cpa_dist > 4.0 or closing < 0.5:
+                continue
+
+            a_spd = _actor_speed_kmh(a)
+            b_spd = _actor_speed_kmh(b)
+
+            if a_spd >= b_spd and meta_a is not None:
+                _set_npc_target_speed(a, max(0.0, a_spd * 0.30), meta_a)
+            elif meta_b is not None:
+                _set_npc_target_speed(b, max(0.0, b_spd * 0.30), meta_b)
+
+            print(
+                f"   🛡️ NPC↔NPC shield: id={a.id} vs id={b.id} "
+                f"| TCPA={tcpa:.2f}s CPA={cpa_dist:.2f}m closing={closing*3.6:.1f}km/h"
+            )
+
+    # --------------------------------------------------------------
+    # 2-4. NPC -> Ego (blind sides only)
+    # --------------------------------------------------------------
+    for npc in live:
+        meta = shield_meta.get(npc.id)
+        if meta is None:
+            continue
+
+        zone = _npc_ego_zone(ego_vehicle, npc)
+
+        if zone == "FRONT":
+            continue
+
+        tcpa, cpa_dist, closing = _closest_approach_metrics(npc, ego_vehicle)
+        if tcpa > 2.0 or cpa_dist > 4.0 or closing < 0.5:
+            continue
+
+        if tcpa < 1.2 and cpa_dist < 1.5:
+            continue
+
+        npc_spd = _actor_speed_kmh(npc)
+
+        if zone == "REAR":
+            if cpa_dist < 1.0 or tcpa < 0.5:
+                target = 0.0
+            else:
+                target = max(0.0, npc_spd * 0.30)
+            _set_npc_target_speed(npc, target, meta)
+            print(
+                f"   🛡️ NPC→Ego REAR shield: id={npc.id} "
+                f"| TCPA={tcpa:.2f}s CPA={cpa_dist:.2f}m target={target:.0f}km/h"
+            )
+        else:
+            if npc_spd < 55.0:
+                target = min(80.0, npc_spd + 30.0)
+            else:
+                target = max(0.0, npc_spd * 0.50)
+            _set_npc_target_speed(npc, target, meta)
+            print(
+                f"   🛡️ NPC→Ego {zone} shield: id={npc.id} "
+                f"| TCPA={tcpa:.2f}s CPA={cpa_dist:.2f}m target={target:.0f}km/h"
+            )
+
+    # --------------------------------------------------------------
+    # Release: if an NPC is no longer a threat, restore its original speed.
+    # --------------------------------------------------------------
+    for npc in live:
+        meta = shield_meta.get(npc.id)
+        if meta is None or not meta.get("active", False):
+            continue
+
+        on_course = False
+
+        for other in live:
+            if other.id == npc.id:
+                continue
+            tcpa, cpa_dist, closing = _closest_approach_metrics(npc, other)
+            if tcpa <= 1.5 and cpa_dist <= 4.0 and closing >= 0.5:
+                on_course = True
+                break
+
+        if not on_course:
+            zone = _npc_ego_zone(ego_vehicle, npc)
+            if zone != "FRONT":
+                tcpa, cpa_dist, closing = _closest_approach_metrics(npc, ego_vehicle)
+                if tcpa <= 2.0 and cpa_dist <= 4.0 and closing >= 0.5:
+                    on_course = True
+
+        if not on_course:
+            _restore_npc_speed(npc, meta)
+
+
+# ==========================================================================
 # 🎯 CROSS-VEHICLE SPAWNING WITH FIXED SPEED
 # ==========================================================================
 def spawn_cross_vehicle_fixed(world, adv_bp, adv_start_wp, adv_end_wp,
                               ego_vehicle, ego_junction_wps,
                               arrival_offset_seconds,
-                              spawn_dist_range=(10.0, 30.0),
-                              min_speed_kmh=25.0, max_speed_kmh=70.0,
+                              spawn_dist_range=(8.0, 15.0),
+                              min_speed_kmh=50.0, max_speed_kmh=80.0,
                               z_offset=1.0):
     """
-    Spawns a cross-traffic vehicle and sets a fixed speed using TM,
-    calculated so that it reaches the conflict point with the given offset
-    relative to the ego. Returns (vehicle, spawn_wp, conflict_wp).
+    Spawn cross-traffic vehicle with a speed calibrated to the ego conflict ETA.
+
+    Velocity handling:
+      * The desired arrival time floor is 2.0 s.
+      * After spawning with autopilot ON and the correct TM speed difference,
+        a short manual-velocity boost (~0.3 s / 6 ticks) is applied so the
+        vehicle actually reaches its cruise speed before TM takes over.
+        TM does NOT provide instant acceleration, so without this step a
+        "54 km/h" target NPC was observed crawling at 27 km/h and arriving
+        late at the conflict point.
     """
     conflict_wp = find_cross_conflict_wp(ego_junction_wps, adv_start_wp, adv_end_wp)
 
-    # Choose spawn distance (with fallbacks)
     spawn_dist = random.uniform(*spawn_dist_range)
     for dist in [spawn_dist, spawn_dist * 0.7, spawn_dist * 0.5, 8.0, 5.0]:
         prev_wps = adv_start_wp.previous(dist)
         if not prev_wps:
             continue
         spawn_wp = prev_wps[0]
+
+        if spawn_wp.lane_type != carla.LaneType.Driving:
+            continue
+
+        vec_to_start = adv_start_wp.transform.location - spawn_wp.transform.location
+        fwd = spawn_wp.transform.get_forward_vector()
+        dot = fwd.x * vec_to_start.x + fwd.y * vec_to_start.y + fwd.z * vec_to_start.z
+        if dot <= 0:
+            continue
+
         transform = spawn_wp.transform
         transform.location.z += z_offset
         adv = world.try_spawn_actor(adv_bp, transform)
         if adv is not None:
-            # Enable autopilot and configure TM
-            adv.set_autopilot(True, tm.get_port())
-            tm.ignore_lights_percentage(adv, 100)
-            tm.ignore_signs_percentage(adv, 100)
-            tm.ignore_vehicles_percentage(adv, 100)
-
-            # Compute ego ETA to conflict
             ego_loc = ego_vehicle.get_location()
             ego_dist = ego_loc.distance(conflict_wp.transform.location)
             ego_v = ego_vehicle.get_velocity()
@@ -397,29 +664,44 @@ def spawn_cross_vehicle_fixed(world, adv_bp, adv_start_wp, adv_end_wp,
                 ego_speed_kmh = 15.0
             ego_eta = ego_dist / (ego_speed_kmh / 3.6)
 
-            desired_arrival_s = max(0.5, ego_eta + arrival_offset_seconds)
-
-            # Total distance the cross vehicle must travel
+            desired_arrival_s = max(2.0, ego_eta + arrival_offset_seconds)
             start_to_conflict = adv_start_wp.transform.location.distance(conflict_wp.transform.location)
             total_adv_dist = dist + start_to_conflict
-
             required_speed_kmh = (total_adv_dist / desired_arrival_s) * 3.6
             required_speed_kmh = float(np.clip(required_speed_kmh, min_speed_kmh, max_speed_kmh))
 
-            # Set TM speed difference (assume urban speed limit = 50 km/h)
             speed_limit_kmh = 50.0
             diff_percent = (speed_limit_kmh - required_speed_kmh) / speed_limit_kmh * 100.0
             diff_percent = float(np.clip(diff_percent, -80.0, 80.0))
-            tm.vehicle_percentage_speed_difference(adv, diff_percent)
 
-            # Set TM path
+            # ----------------------------------------------------------
+            # Phase 1: manual velocity boost so the NPC actually reaches
+            # cruise speed before TM takes over. Without this, TM ramps up
+            # from 0 m/s and the NPC arrives at the conflict point 1-2 s
+            # late, causing late T-bone collisions in Scenario 1.
+            # ----------------------------------------------------------
+            adv.set_autopilot(False)
+            for _ in range(6):  # ~0.30 s at fixed_delta_seconds=0.05
+                push_cross_vehicle_initial(adv, required_speed_kmh)
+                world.tick()
+
+            # ----------------------------------------------------------
+            # Phase 2: hand control back to TM with the correct target.
+            # ----------------------------------------------------------
+            adv.set_autopilot(True, tm.get_port())
+            tm.ignore_lights_percentage(adv, 100)
+            tm.ignore_signs_percentage(adv, 100)
+            tm.ignore_vehicles_percentage(adv, 0)
+            tm.vehicle_percentage_speed_difference(adv, diff_percent)
             set_forward_tm_path(tm, adv, spawn_wp, adv_start_wp, adv_end_wp)
 
-            # Give an initial push
-            push_cross_vehicle_initial(adv, required_speed_kmh)
+            # One extra settle tick so TM picks up the correct state.
+            world.tick()
 
-            return adv, spawn_wp, conflict_wp
-    return None, None, None
+            return adv, spawn_wp, conflict_wp, diff_percent
+
+    return None, None, None, 0.0
+
 
 def get_crossing_threat(vehicle, route, crossing_vehicles, max_ego_distance=22.0, max_route_gap=6.0):
     """
@@ -505,6 +787,8 @@ def main():
     current_route = []
     adversary_vehicles = []
     crossing_adversary_vehicles = []
+    # Per-NPC shield metadata: {"orig_diff": float, "active": bool}
+    npc_shield_meta = {}
     walker_list = []
     moving_cyclists = []
     current_scenario_id = 1
@@ -563,6 +847,7 @@ def main():
             tl.freeze(False)
         clear_adversaries()
         crossing_adversary_vehicles.clear()
+        npc_shield_meta.clear()
         moving_cyclists.clear()
         current_radar_distance = 30.0
         collision_flag = False
@@ -591,7 +876,8 @@ def main():
             if spawn_wp is None:
                 if junction_entries:
                     candidate_wp = random.choice(junction_entries)
-                    prev_wps = candidate_wp.previous(5.0)
+                    ego_pre_junction_dist = 10.0 if test_scenario_counter == 3 else 5.0
+                    prev_wps = candidate_wp.previous(ego_pre_junction_dist)
                     spawn_wp = prev_wps[0] if prev_wps else candidate_wp
                 else:
                     spawn_points = world.get_map().get_spawn_points()
@@ -639,7 +925,7 @@ def main():
         if vehicle is None:
             raise RuntimeError("Failed to spawn Ego vehicle.")
         else:
-            print("   🚗 Ego start position: ~5.0m before junction for non-crosswalk scenarios.")
+            print("   🚗 Ego start position: ~5.0m before junction (10.0m for scenario 3) for non-crosswalk scenarios.")
 
         current_scenario_id = test_scenario_counter
         scenario_id = test_scenario_counter
@@ -673,30 +959,34 @@ def main():
         # ================= SCENARIO BUILDING =================
         if scenario_id == 1:
             print("🚑 Target: Emergency Vehicle Ambush (Fixed Speed)")
+            print("   🛡️ NPC safety shield handles blind-side NPC→Ego and any NPC↔NPC collision course.")
+            print("   🚦 NPCs still cross BEFORE Ego on their original schedule — no forced yielding.")
             if valid_cross_paths:
                 chosen_path = random.choice(valid_cross_paths)
                 adv_start_wp, adv_end_wp = chosen_path
-                arrival_offset = random.uniform(-5.0, -3.0)
-                adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                arrival_offset = random.uniform(-6.0, -4.0)
+                adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                     world, random.choice(emergency_bps), adv_start_wp, adv_end_wp,
                     vehicle, ego_junction_wps, arrival_offset
                 )
                 if adv:
                     adversary_vehicles.append(adv)
                     crossing_adversary_vehicles.append(adv)
+                    npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
                     print(f"   ✅ Emergency vehicle: offset {arrival_offset:+.1f}s")
 
                 other_paths = [p for p in valid_cross_paths if p != chosen_path]
                 if other_paths:
                     adv_start_wp2, adv_end_wp2 = random.choice(other_paths)
-                    arrival_offset2 = random.uniform(2.0, 4.0)
-                    adv2, spawn_wp2, conflict_wp2 = spawn_cross_vehicle_fixed(
+                    arrival_offset2 = min(-2.5, arrival_offset + random.uniform(3.0, 3.6))
+                    adv2, spawn_wp2, conflict_wp2, orig_diff2 = spawn_cross_vehicle_fixed(
                         world, random.choice(emergency_bps), adv_start_wp2, adv_end_wp2,
                         vehicle, ego_junction_wps, arrival_offset2
                     )
                     if adv2:
                         adversary_vehicles.append(adv2)
                         crossing_adversary_vehicles.append(adv2)
+                        npc_shield_meta[adv2.id] = {"orig_diff": orig_diff2, "active": False}
                         print(f"   ✅ Secondary emergency: offset {arrival_offset2:+.1f}s")
 
             if ego_junction_wps:
@@ -717,28 +1007,29 @@ def main():
                     same_path = True
 
                 if not same_path:
-                    offsets = [random.uniform(-5.0, -3.0), random.uniform(2.0, 4.0)]
+                    offsets = [random.uniform(-7.0, -5.0), random.uniform(-5.0, -3.0)]
                     for i, path in enumerate(selected_paths):
                         adv_start_wp, adv_end_wp = path
-                        adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                        adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                             world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                             vehicle, ego_junction_wps, offsets[i]
                         )
                         if adv:
                             adversary_vehicles.append(adv)
                             crossing_adversary_vehicles.append(adv)
+                            npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
                             print(f"   ✅ Cross vehicle {i+1}: offset {offsets[i]:+.1f}s")
                 else:
-                    # Same path: only ONE vehicle to avoid rear-end collisions
                     adv_start_wp, adv_end_wp = selected_paths[0]
-                    offset1 = random.uniform(-5.0, -3.0)
-                    adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                    offset1 = random.uniform(-6.0, -3.0)
+                    adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                         world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                         vehicle, ego_junction_wps, offset1
                     )
                     if adv:
                         adversary_vehicles.append(adv)
                         crossing_adversary_vehicles.append(adv)
+                        npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
                         print(f"   ✅ Cross vehicle (same path, only one): offset {offset1:+.1f}s")
 
             if ego_junction_wps:
@@ -750,27 +1041,38 @@ def main():
 
         elif scenario_id == 3:
             print("🚙🔀 Target: Convoy + Cross Threat (Fixed Speed)")
-            adv_wp, lead_distance = find_lead_wp_before_first_junction(vehicle, current_route, min_ahead=2.0, max_ahead=4.0)
+            adv_wp, lead_distance = find_lead_wp_ahead(vehicle, current_route, min_ahead=6.0, max_ahead=11.0)
+
             if adv_wp is not None:
                 adv_transform = adv_wp.transform
                 adv_transform.location.z += 1.0
                 adv = world.try_spawn_actor(random.choice(adv_bps), adv_transform)
                 if adv:
                     adv.set_autopilot(True, tm.get_port())
+                    tm.ignore_lights_percentage(adv, 100)
                     tm.vehicle_percentage_speed_difference(adv, 50.0)
+
+                    fwd = adv_transform.get_forward_vector()
+                    adv.set_target_velocity(carla.Vector3D(fwd.x * 3.5, fwd.y * 3.5, 0.0))
+
                     adversary_vehicles.append(adv)
-                    print(f"   ✅ Slow lead vehicle spawned {lead_distance:.1f}m ahead")
+                    print(f"   ✅ Slow lead vehicle spawned {lead_distance:.1f}m ahead (Safe Gap)")
+                else:
+                    print("   ⚠️ Lead vehicle spawn blocked by collision")
+            else:
+                print("   ⚠️ Could not spawn lead vehicle (Route too short)")
             if valid_cross_paths:
                 chosen_path = random.choice(valid_cross_paths)
                 adv_start_wp, adv_end_wp = chosen_path
                 arrival_offset = random.uniform(-5.0, -3.0)
-                adv2, spawn_wp2, conflict_wp2 = spawn_cross_vehicle_fixed(
+                adv2, spawn_wp2, conflict_wp2, orig_diff = spawn_cross_vehicle_fixed(
                     world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                     vehicle, ego_junction_wps, arrival_offset
                 )
                 if adv2:
                     adversary_vehicles.append(adv2)
                     crossing_adversary_vehicles.append(adv2)
+                    npc_shield_meta[adv2.id] = {"orig_diff": orig_diff, "active": False}
                     print(f"   ✅ Cross traffic: offset {arrival_offset:+.1f}s")
 
             if ego_junction_wps:
@@ -791,28 +1093,29 @@ def main():
                     same_path = True
 
                 if not same_path:
-                    offsets = [random.uniform(-5.0, -3.0), random.uniform(2.0, 4.0)]
+                    offsets = [random.uniform(-7.0, -5.0), random.uniform(-5.0, -3.0)]
                     for i, path in enumerate(selected_paths):
                         adv_start_wp, adv_end_wp = path
-                        adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                        adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                             world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                             vehicle, ego_junction_wps, offsets[i]
                         )
                         if adv:
                             adversary_vehicles.append(adv)
                             crossing_adversary_vehicles.append(adv)
+                            npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
                             print(f"   ✅ Aggressive vehicle {i+1}: offset {offsets[i]:+.1f}s")
                 else:
-                    # Same path: only ONE vehicle
                     adv_start_wp, adv_end_wp = selected_paths[0]
-                    offset1 = random.uniform(-5.0, -3.0)
-                    adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                    offset1 = random.uniform(-7.0, -4.0)
+                    adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                         world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                         vehicle, ego_junction_wps, offset1
                     )
                     if adv:
                         adversary_vehicles.append(adv)
                         crossing_adversary_vehicles.append(adv)
+                        npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
                         print(f"   ✅ Aggressive vehicle (same path, only one): offset {offset1:+.1f}s")
 
             if ego_junction_wps:
@@ -825,38 +1128,125 @@ def main():
         elif scenario_id == 5:
             print("🔄 Target: Staggered Yield Chain (Fixed Speed)")
             if valid_cross_paths:
-                # Static occluder
-                chosen_path = random.choice(valid_cross_paths)
-                cross_start_wp = chosen_path[0]
-                prev_wps = cross_start_wp.previous(random.uniform(2.0, 5.0))
-                static_wp = prev_wps[0] if prev_wps else cross_start_wp
+                static_path = random.choice(valid_cross_paths)
+                cross_start_wp = static_path[0]
+
+                # -----------------------------------------------------------------
+                # STATIC OCCLUDER PLACEMENT
+                # The occluder must sit clearly on the cross road, BEFORE the
+                # junction, and away from ego's lane corridor.
+                #
+                # Two safety measures:
+                #   1. Take a waypoint 7-10 m back from the junction entry and
+                #      pick the FURTHEST one in the returned list (previously we
+                #      took [0], the closest at ~1 m, which put the vehicle in
+                #      ego's lane corridor at the junction entrance).
+                #   2. If the resulting position still lands on ego's lane,
+                #      push the occluder further back along the cross road
+                #      until it is clear.
+                # -----------------------------------------------------------------
+                backward_dist = random.uniform(7.0, 10.0)
+                prev_wps = cross_start_wp.previous(backward_dist)
+                if prev_wps:
+                    static_wp = max(
+                        prev_wps,
+                        key=lambda w: w.transform.location.distance(cross_start_wp.transform.location),
+                    )
+                else:
+                    static_wp = cross_start_wp
+
+                # -----------------------------------------------------------------
+                # Validate the occluder is not on ego's lane. If it is, move
+                # further back along the cross road until it is clear.
+                # -----------------------------------------------------------------
+                def _is_on_ego_lane(test_loc):
+                    try:
+                        ego_wp = world.get_map().get_waypoint(
+                            vehicle.get_location(),
+                            project_to_road=True,
+                            lane_type=carla.LaneType.Driving,
+                        )
+                        test_wp = world.get_map().get_waypoint(
+                            test_loc,
+                            project_to_road=True,
+                            lane_type=carla.LaneType.Driving,
+                        )
+                        if ego_wp is None or test_wp is None:
+                            return False
+                        return (
+                            ego_wp.road_id == test_wp.road_id
+                            and ego_wp.lane_id == test_wp.lane_id
+                        )
+                    except Exception:
+                        return False
+
+                max_push_attempts = 6
+                for attempt in range(max_push_attempts):
+                    if not _is_on_ego_lane(static_wp.transform.location):
+                        break
+                    extra = 3.0
+                    more_prev = static_wp.previous(extra)
+                    if not more_prev:
+                        break
+                    static_wp = max(
+                        more_prev,
+                        key=lambda w: w.transform.location.distance(cross_start_wp.transform.location),
+                    )
+                    print(f"   ↻ Static occluder pushed back (still on ego's lane, attempt {attempt+1})")
+
+                # -----------------------------------------------------------------
+                # Lateral offset: shift the occluder sideways on the cross road
+                # so it partially blocks the cross lane but leaves room for the
+                # moving vehicle to pass. Use the cross road's right vector.
+                # -----------------------------------------------------------------
+                right_vec = static_wp.transform.get_right_vector()
+                lane_w = static_wp.lane_width if static_wp.lane_width > 0 else 3.5
+                side_offset = lane_w * 0.5 + 2.0   # ~3.75 m for a 3.5 m lane
+
                 static_transform = static_wp.transform
                 static_transform.location.z += 1.0
-                right_vec = static_wp.transform.get_right_vector()
-                side = random.choice([-1, 1])
-                side_offset = random.uniform(1.8, 2.5)
-                static_transform.location.x += right_vec.x * side * side_offset
-                static_transform.location.y += right_vec.y * side * side_offset
+                static_transform.location.x += right_vec.x * side_offset
+                static_transform.location.y += right_vec.y * side_offset
+
                 static_adv = world.try_spawn_actor(random.choice(adv_bps), static_transform)
                 if static_adv:
+                    static_adv.set_autopilot(False)
                     adversary_vehicles.append(static_adv)
-                    print("   ✅ Partial-view static occluder spawned")
+                    print(
+                        f"   ✅ Static occluder spawned {side_offset:.1f}m off the cross lane "
+                        f"({backward_dist:.1f}m before junction)"
+                    )
+                else:
+                    print("   ⚠️ Static occluder spawn blocked, skipping")
 
-                # Moving cross vehicle
-                chosen_path = random.choice(valid_cross_paths)
+                # -----------------------------------------------------------------
+                # Moving cross vehicle (unchanged)
+                # -----------------------------------------------------------------
+                moving_paths = [p for p in valid_cross_paths if p != static_path]
+                if not moving_paths:
+                    moving_paths = valid_cross_paths
+                chosen_path = random.choice(moving_paths)
                 adv_start_wp, adv_end_wp = chosen_path
-                arrival_offset = random.uniform(-5.0, -3.0)
-                moving_adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                arrival_offset = random.uniform(-7.0, -4.0)
+                moving_adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                     world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                     vehicle, ego_junction_wps, arrival_offset
                 )
                 if moving_adv:
                     adversary_vehicles.append(moving_adv)
                     crossing_adversary_vehicles.append(moving_adv)
+                    npc_shield_meta[moving_adv.id] = {"orig_diff": orig_diff, "active": False}
                     print(f"   ✅ Moving cross vehicle: offset {arrival_offset:+.1f}s")
 
+            if ego_junction_wps:
+                for tl_actor in world.get_actors().filter('traffic.traffic_light'):
+                    if tl_actor.get_location().distance(ego_junction_wps[0].transform.location) < 45.0:
+                        tl_actor.set_state(carla.TrafficLightState.Green)
+                        tl_actor.freeze(True)
+                print("   🚦 Forced nearby Traffic Lights to GREEN for ego vehicle.")
+                
         elif scenario_id == 6:
-            print("🚶 Target: Pedestrian Crosswalk Crossing (Real Crosswalk, slow speed)")
+            print("🚶 Target: Pedestrian Crosswalk Crossing (Real Crosswalk, Tuned)")
             if target_crosswalk_wp is not None:
                 crosswalk_wp = target_crosswalk_wp
                 cw_center = crosswalk_wp.transform.location
@@ -864,43 +1254,55 @@ def main():
                 cw_fwd = crosswalk_wp.transform.get_forward_vector()
                 cw_half_w = crosswalk_wp.lane_width / 2.0 + 1.0
                 print(f"   🦓 REAL Crosswalk found!")
+
                 side = random.choice([-1, 1])
                 sidewalk_offset = cw_half_w + 0.5
-                spawn_loc = carla.Location(x=cw_center.x + cw_right.x * side * sidewalk_offset,
-                                           y=cw_center.y + cw_right.y * side * sidewalk_offset,
-                                           z=cw_center.z + 1.0)
-                target_loc = carla.Location(x=cw_center.x - cw_right.x * side * sidewalk_offset,
-                                            y=cw_center.y - cw_right.y * side * sidewalk_offset,
-                                            z=cw_center.z)
+
+                spawn_loc = carla.Location(
+                    x=cw_center.x + cw_right.x * side * sidewalk_offset,
+                    y=cw_center.y + cw_right.y * side * sidewalk_offset,
+                    z=cw_center.z + 1.0
+                )
+                target_loc = carla.Location(
+                    x=cw_center.x - cw_right.x * side * sidewalk_offset,
+                    y=cw_center.y - cw_right.y * side * sidewalk_offset,
+                    z=cw_center.z
+                )
                 cross_yaw = math.degrees(math.atan2(-cw_right.y * side, -cw_right.x * side))
-                spawn_rotation = carla.Rotation(yaw=cross_yaw)
                 walker_bp = random.choice(list(walker_bps))
                 if walker_bp.has_attribute('is_invincible'):
                     walker_bp.set_attribute('is_invincible', 'false')
-                walker = world.try_spawn_actor(walker_bp, carla.Transform(spawn_loc, spawn_rotation))
+                walker = world.try_spawn_actor(walker_bp, carla.Transform(spawn_loc, carla.Rotation(yaw=cross_yaw)))
+
+                trigger_dist = 22.0
                 if walker:
-                    speed = 0.8 + random.uniform(0, 0.3)  # slow pedestrian
-                    trigger_dist = 15.0
+                    speed = 1.3 + random.uniform(-0.1, 0.2)
                     walker_list.append((None, walker, target_loc, speed, trigger_dist, cw_center))
-                    print(f"   ✅ Pedestrian on {'right' if side > 0 else 'left'} sidewalk (slow)")
+                    print(f"   ✅ Pedestrian on {'right' if side > 0 else 'left'} sidewalk")
+
                 if random.random() < 0.4:
-                    spawn_loc2 = carla.Location(x=cw_center.x - cw_right.x * side * sidewalk_offset,
-                                                y=cw_center.y - cw_right.y * side * sidewalk_offset,
-                                                z=cw_center.z + 1.0)
-                    target_loc2 = carla.Location(x=cw_center.x + cw_right.x * side * sidewalk_offset,
-                                                 y=cw_center.y + cw_right.y * side * sidewalk_offset,
-                                                 z=cw_center.z)
+                    spawn_loc2 = carla.Location(
+                        x=cw_center.x - cw_right.x * side * sidewalk_offset + cw_fwd.x * 1.8,
+                        y=cw_center.y - cw_right.y * side * sidewalk_offset + cw_fwd.y * 1.8,
+                        z=cw_center.z + 1.0
+                    )
+                    target_loc2 = carla.Location(
+                        x=cw_center.x + cw_right.x * side * sidewalk_offset + cw_fwd.x * 1.8,
+                        y=cw_center.y + cw_right.y * side * sidewalk_offset + cw_fwd.y * 1.8,
+                        z=cw_center.z
+                    )
                     cross_yaw2 = math.degrees(math.atan2(cw_right.y * side, cw_right.x * side))
                     walker_bp2 = random.choice(list(walker_bps))
                     if walker_bp2.has_attribute('is_invincible'):
                         walker_bp2.set_attribute('is_invincible', 'false')
                     walker2 = world.try_spawn_actor(walker_bp2, carla.Transform(spawn_loc2, carla.Rotation(yaw=cross_yaw2)))
                     if walker2:
-                        speed2 = 0.8
+                        speed2 = 1.2
                         walker_list.append((None, walker2, target_loc2, speed2, trigger_dist, cw_center))
-                        print(f"   ✅ Second pedestrian (slow)")
+                        print(f"   ✅ Second pedestrian (Offset parallel line)")
             else:
                 print(f"   ⚠️ No real crosswalks in map. Skipping scenario 6 pedestrian.")
+
             if ego_junction_wps:
                 all_tls = world.get_actors().filter('traffic.traffic_light')
                 for tl_actor in all_tls:
@@ -911,7 +1313,7 @@ def main():
 
         elif scenario_id == 7:
             print("🚴 Target: Cyclist in Path (Slow/Stationary Obstacle)")
-            cyclist_idx = min(int(noisy_dist(15, 4)), len(current_route) - 1)
+            cyclist_idx = min(int(noisy_dist(11, 3)), len(current_route) - 2)
             cyclist_wp = current_route[cyclist_idx]
             cyclist_transform = cyclist_wp.transform
             cyclist_transform.location.z += 1.0
@@ -924,97 +1326,103 @@ def main():
                 moving_cyclists.append(cyclist)
                 adversary_vehicles.append(cyclist)
                 print(f"   ✅ Slow cyclist spawned at {cyclist_idx}m")
+
             if ego_junction_wps:
-                all_tls = world.get_actors().filter('traffic.traffic_light')
-                for tl_actor in all_tls:
-                    tl_loc = tl_actor.get_location()
-                    if tl_loc.distance(ego_junction_wps[0].transform.location) < 60.0:
-                        for stop_wp in tl_actor.get_stop_waypoints():
-                            if stop_wp.road_id == current_route[0].road_id and stop_wp.lane_id == current_route[0].lane_id:
-                                tl_actor.set_state(carla.TrafficLightState.Green)
-                                tl_actor.freeze(True)
-                                print("   🚦 Forced Traffic Light to GREEN for ego vehicle.")
-                                break
-            if random.random() < 0.5:
-                ped_idx2 = min(cyclist_idx + random.randint(5, 10), len(current_route) - 1)
+                for tl_actor in world.get_actors().filter('traffic.traffic_light'):
+                    if tl_actor.get_location().distance(ego_junction_wps[0].transform.location) < 45.0:
+                        tl_actor.set_state(carla.TrafficLightState.Green)
+                        tl_actor.freeze(True)
+                print("   🚦 Forced nearby Traffic Lights to GREEN for ego vehicle.")
+
+            if random.random() < 0.4:
+                ped_idx2 = max(11, cyclist_idx - random.randint(5, 7))
                 ped_wp2 = current_route[ped_idx2]
                 right_vec2 = ped_wp2.transform.get_right_vector()
                 ped_loc2 = ped_wp2.transform.location
                 side2 = random.choice([-1, 1])
-                spawn_loc_ped = carla.Location(x=ped_loc2.x + right_vec2.x * side2 * 5.0,
-                                               y=ped_loc2.y + right_vec2.y * side2 * 5.0,
-                                               z=ped_loc2.z + 1.0)
-                target_loc_ped = carla.Location(x=ped_loc2.x - right_vec2.x * side2 * 5.0,
-                                                y=ped_loc2.y - right_vec2.y * side2 * 5.0,
-                                                z=ped_loc2.z)
+
+                spawn_loc_ped = carla.Location(
+                    x=ped_loc2.x + right_vec2.x * side2 * 4.5,
+                    y=ped_loc2.y + right_vec2.y * side2 * 4.5,
+                    z=ped_loc2.z + 1.0
+                )
+                target_loc_ped = carla.Location(
+                    x=ped_loc2.x - right_vec2.x * side2 * 4.5,
+                    y=ped_loc2.y - right_vec2.y * side2 * 4.5,
+                    z=ped_loc2.z
+                )
+                cross_yaw = math.degrees(math.atan2(-right_vec2.y * side2, -right_vec2.x * side2))
                 walker_bp_bonus = random.choice(list(walker_bps))
                 if walker_bp_bonus.has_attribute('is_invincible'):
                     walker_bp_bonus.set_attribute('is_invincible', 'false')
-                walker_bonus = world.try_spawn_actor(walker_bp_bonus, carla.Transform(spawn_loc_ped))
+
+                walker_bonus = world.try_spawn_actor(walker_bp_bonus, carla.Transform(spawn_loc_ped, carla.Rotation(yaw=cross_yaw)))
                 if walker_bonus:
-                    world.tick()
-                    ctrl_bonus = world.spawn_actor(walker_controller_bp, carla.Transform(), walker_bonus)
-                    world.tick()
-                    ctrl_bonus.start()
-                    ctrl_bonus.go_to_location(target_loc_ped)
-                    ctrl_bonus.set_max_speed(1.2)
-                    walker_list.append((ctrl_bonus, walker_bonus, target_loc_ped))
-                    print("   ✅ Bonus pedestrian near cyclist")
+                    speed_ped = 1.1
+                    trigger_dist = 11.0
+                    walker_list.append((None, walker_bonus, target_loc_ped, speed_ped, trigger_dist, ped_loc2))
+                    print(f"   ✅ Occasional pedestrian spawned behind cyclist at {ped_idx2}m (Trigger at {trigger_dist}m)")
 
         elif scenario_id == 8:
-            print("🚶🚗 Target: Pedestrian Crosswalk + Vehicle Combo (Fixed Speed)")
+            print("🚶🚗 Target: Pedestrian Crosswalk + Vehicle Combo (Synchronized)")
+
             if target_crosswalk_wp is not None:
                 crosswalk_wp = target_crosswalk_wp
                 cw_center = crosswalk_wp.transform.location
                 cw_right = crosswalk_wp.transform.get_right_vector()
                 cw_fwd = crosswalk_wp.transform.get_forward_vector()
                 cw_half_w = crosswalk_wp.lane_width / 2.0 + 1.0
-                print(f"   🦓 REAL Crosswalk found!")
+                print(f"   🦓 REAL Crosswalk found near junction!")
+
                 side = random.choice([-1, 1])
                 sidewalk_offset = cw_half_w + 0.5
-                spawn_loc = carla.Location(x=cw_center.x + cw_right.x * side * sidewalk_offset,
-                                           y=cw_center.y + cw_right.y * side * sidewalk_offset,
-                                           z=cw_center.z + 1.0)
-                target_loc = carla.Location(x=cw_center.x - cw_right.x * side * sidewalk_offset,
-                                            y=cw_center.y - cw_right.y * side * sidewalk_offset,
-                                            z=cw_center.z)
+                spawn_loc = carla.Location(
+                    x=cw_center.x + cw_right.x * side * sidewalk_offset,
+                    y=cw_center.y + cw_right.y * side * sidewalk_offset,
+                    z=cw_center.z + 1.0
+                )
+                target_loc = carla.Location(
+                    x=cw_center.x - cw_right.x * side * sidewalk_offset,
+                    y=cw_center.y - cw_right.y * side * sidewalk_offset,
+                    z=cw_center.z
+                )
                 cross_yaw = math.degrees(math.atan2(-cw_right.y * side, -cw_right.x * side))
-                spawn_rotation = carla.Rotation(yaw=cross_yaw)
                 walker_bp = random.choice(list(walker_bps))
                 if walker_bp.has_attribute('is_invincible'):
                     walker_bp.set_attribute('is_invincible', 'false')
-                walker = world.try_spawn_actor(walker_bp, carla.Transform(spawn_loc, spawn_rotation))
+
+                walker = world.try_spawn_actor(walker_bp, carla.Transform(spawn_loc, carla.Rotation(yaw=cross_yaw)))
                 if walker:
-                    speed = 0.8  # slow pedestrian
-                    trigger_dist = 15.0
+                    speed = 1.25
+                    trigger_dist = 16.0
                     walker_list.append((None, walker, target_loc, speed, trigger_dist, cw_center))
-                    print(f"   ✅ Pedestrian on {'right' if side > 0 else 'left'} sidewalk (slow)")
+                    print(f"   ✅ Pedestrian active on {'right' if side > 0 else 'left'} sidewalk")
             else:
-                print(f"   ⚠️ No real crosswalks in map. Skipping scenario 8 pedestrian.")
+                print(f"   ⚠️ No real crosswalks near junction. Skipping scenario 8 pedestrian.")
 
             if valid_cross_paths and ego_junction_wps:
                 ego_exit_wp = ego_junction_wps[-1]
-                true_crossing_paths = []
-                for path in valid_cross_paths:
-                    if path[1].transform.location.distance(ego_exit_wp.transform.location) > 5.0:
-                        true_crossing_paths.append(path)
+                true_crossing_paths = [p for p in valid_cross_paths if p[1].transform.location.distance(ego_exit_wp.transform.location) > 5.0]
                 if not true_crossing_paths:
                     true_crossing_paths = valid_cross_paths
+
                 chosen_path = random.choice(true_crossing_paths)
-                adv_start_wp, adv_end_wp = chosen_path[0], chosen_path[1]
-                arrival_offset = random.uniform(-5.0, -3.0)
-                adv, spawn_wp, conflict_wp = spawn_cross_vehicle_fixed(
+                adv_start_wp, adv_end_wp = chosen_path
+
+                arrival_offset = random.uniform(1.5, 3.5)
+
+                adv, spawn_wp, conflict_wp, orig_diff = spawn_cross_vehicle_fixed(
                     world, random.choice(adv_bps), adv_start_wp, adv_end_wp,
                     vehicle, ego_junction_wps, arrival_offset
                 )
                 if adv:
                     adversary_vehicles.append(adv)
                     crossing_adversary_vehicles.append(adv)
-                    print(f"   ✅ Cross-traffic: offset {arrival_offset:+.1f}s")
+                    npc_shield_meta[adv.id] = {"orig_diff": orig_diff, "active": False}
+                    print(f"   ✅ Cross-traffic synced with ped-delay: offset {arrival_offset:+.1f}s")
 
             if ego_junction_wps:
-                all_tls = world.get_actors().filter('traffic.traffic_light')
-                for tl_actor in all_tls:
+                for tl_actor in world.get_actors().filter('traffic.traffic_light'):
                     if tl_actor.get_location().distance(ego_junction_wps[0].transform.location) < 45.0:
                         tl_actor.set_state(carla.TrafficLightState.Green)
                         tl_actor.freeze(True)
@@ -1025,6 +1433,9 @@ def main():
             test_scenario_counter = random.randint(1, 8)
         else:
             test_scenario_counter = FORCE_SCENARIO
+
+        for _ in range(5):
+            world.tick()
 
         spectator = world.get_spectator()
         spectator_loc = final_transform.location + carla.Location(z=10.0) - final_transform.get_forward_vector() * 15.0
@@ -1096,11 +1507,60 @@ def main():
 
         collision_bp = blueprint_library.find('sensor.other.collision')
         collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=vehicle)
+
         def collision_callback(event):
+            """
+            Instrumented collision reporter.
+
+            Prints the relative position of the colliding actor with respect
+            to Ego (REAR / FRONT / LEFT / RIGHT), the 3-D separation distance,
+            Ego's speed, the other actor's speed, and the signed closing speed
+            projected onto Ego's forward axis.
+            """
             nonlocal collision_flag
             other = event.other_actor
-            print(f"💥 COLLISION with {other.type_id} (id={other.id})")
+            try:
+                ego_loc = vehicle.get_location()
+                ego_fwd = vehicle.get_transform().get_forward_vector()
+                ego_right = vehicle.get_transform().get_right_vector()
+                other_loc = other.get_location()
+
+                dx = other_loc.x - ego_loc.x
+                dy = other_loc.y - ego_loc.y
+                dz = other_loc.z - ego_loc.z
+
+                long_proj = ego_fwd.x * dx + ego_fwd.y * dy
+                lat_proj = ego_right.x * dx + ego_right.y * dy
+                distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                if abs(lat_proj) > abs(long_proj):
+                    relative = "RIGHT" if lat_proj > 0 else "LEFT"
+                else:
+                    relative = "FRONT" if long_proj > 0 else "REAR"
+
+                ego_v = vehicle.get_velocity()
+                ego_speed_kmh = 3.6 * math.sqrt(ego_v.x**2 + ego_v.y**2 + ego_v.z**2)
+
+                other_speed_kmh = 0.0
+                closing_kmh = 0.0
+                try:
+                    other_v = other.get_velocity()
+                    other_speed_kmh = 3.6 * math.sqrt(other_v.x**2 + other_v.y**2 + other_v.z**2)
+                    closing_ms = (other_v.x - ego_v.x) * ego_fwd.x + (other_v.y - ego_v.y) * ego_fwd.y
+                    closing_kmh = closing_ms * 3.6
+                except Exception:
+                    pass
+
+                print(f"💥 COLLISION with {other.type_id} (id={other.id})")
+                print(f"   📍 Relative: {relative}")
+                print(f"   📏 Distance: {distance:.2f}m")
+                print(f"   🚗 Ego speed: {ego_speed_kmh:.1f} km/h")
+                print(f"   🚙 Adv speed: {other_speed_kmh:.1f} km/h")
+                print(f"   📈 Closing:  {closing_kmh:+.1f} km/h")
+            except Exception as e:
+                print(f"💥 COLLISION with {other.type_id} (id={other.id}) [report error: {e}]")
             collision_flag = True
+
         collision_sensor.listen(lambda event: collision_callback(event))
 
         world.tick()
@@ -1153,10 +1613,29 @@ def main():
                 brake = msg.get("brake", 0.0)
                 control = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
                 vehicle.apply_control(control)
+
+                # ==========================================================
+                # NPC SAFETY SHIELD — active ONLY for scenarios 1-5
+                # ----------------------------------------------------------
+                # Scenarios 6, 7, 8 are intentionally NOT shielded:
+                #   - 6/7 place an obstacle directly on Ego's path; the RL
+                #     policy must perceive and respond on its own.
+                #   - 8 is a multi-threat scenario (pedestrian + vehicle);
+                #     the challenge must remain and the vehicle arrives after
+                #     the pedestrian triggers.
+                # The shield runs BEFORE world.tick() so adjustments take
+                # effect on this tick.
+                # ==========================================================
+                if crossing_adversary_vehicles and current_scenario_id in [1, 2, 3, 4, 5]:
+                    npc_safety_shield(
+                        vehicle,
+                        crossing_adversary_vehicles,
+                        npc_shield_meta,
+                    )
+
                 world.tick()
                 draw_route(world, current_route, life_time=0.1)
 
-                # Pedestrian cleanup & control
                 to_remove = []
                 for idx, item in enumerate(walker_list):
                     ctrl = item[0]
